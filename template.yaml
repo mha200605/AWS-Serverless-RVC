@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  rvc-serverless - asynchronous Applio (RVC) voice conversion on scale-to-zero GPU AWS Batch.
+  Models come from an allow-listed Hugging Face repository per request; nothing model-related is baked
+  into the image. NOT DEPLOYED: review every parameter and README "Before you deploy" first.
+
+# ---------------------------------------------------------------------------------------------
+Parameters:
+  AllowedHfRepos:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9._/*,-]+$'
+    Description: >
+      REQUIRED, no default (fail closed). Comma-separated "owner/repo" or "owner/*" entries that jobs may
+      load models from, e.g. "my-user/my-rvc-models".
+  DefaultHfRepo:
+    Type: String
+    Default: ""
+    Description: Optional repo used when a request omits repo_id (must also be allowed above).
+  RequirePinnedRevision:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      "true" = requests must give a 40-char commit SHA. Strongly recommended once testing is done: .pth files
+      are pickle-based, so a branch that can change under you is a code-execution risk.
+  HfTokenSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ARN of a Secrets Manager secret holding a READ-ONLY, repo-scoped Hugging Face token
+      (plain string, or JSON {"token": "..."}). Leave empty for public repositories.
+  AllowedInputHosts:
+    Type: String
+    Default: ""
+    Description: Comma-separated hosts allowed for the optional "input_url" feature. Empty = feature disabled.
+  WorkerImageTag:
+    Type: String
+    Description: Tag of the worker image pushed to the ECR repository created by this stack (tags are immutable).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: PUBLIC subnets (auto-assign public IPv4) so no NAT gateway (~$33/month) is needed.
+  GpuInstanceType:
+    Type: String
+    Default: g4dn.xlarge
+    AllowedValues: [g4dn.xlarge, g6.xlarge, g5.xlarge]
+  MaxVCpus:
+    Type: Number
+    Default: 4
+    AllowedValues: [4]
+    Description: Hard cap = exactly one 4-vCPU GPU instance. Raising it is a deliberate template edit.
+  RootVolumeGiB:
+    Type: Number
+    Default: 100
+    MinValue: 50
+    MaxValue: 200
+  JobTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 120
+    MaxValue: 3600
+  MaxInputMB:
+    Type: Number
+    Default: 50
+  MaxInputSeconds:
+    Type: Number
+    Default: 300
+  MaxPthMB:
+    Type: Number
+    Default: 512
+  MaxIndexMB:
+    Type: Number
+    Default: 1024
+  InputRetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 1
+  OutputRetentionDays:
+    Type: Number
+    Default: 3
+    MinValue: 1
+  MetadataRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+  ApiRateLimit:
+    Type: Number
+    Default: 5
+  ApiBurstLimit:
+    Type: Number
+    Default: 10
+  EnableHostModelCache:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      "true" keeps downloaded models (commit-pinned only) on the GPU instance's encrypted disk for reuse by
+      later jobs until the instance scales in. Off by default for privacy; see README trade-offs.
+  BudgetEmail:
+    Type: String
+    Default: ""
+    Description: If set, creates a monthly cost budget with email alerts at 50/80/100% (alerts only, not a hard cap).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 20
+
+Conditions:
+  HasHfToken: !Not [!Equals [!Ref HfTokenSecretArn, ""]]
+  EnableCache: !Equals [!Ref EnableHostModelCache, "true"]
+  HasBudget: !Not [!Equals [!Ref BudgetEmail, ""]]
+
+# ---------------------------------------------------------------------------------------------
+Resources:
+  # ---------- storage: everything private, TLS-only, encrypted, auto-expiring ----------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-input-audio
+            Status: Enabled
+            Prefix: inputs/
+            ExpirationInDays: !Ref InputRetentionDays
+          - Id: expire-output-audio
+            Status: Enabled
+            Prefix: outputs/
+            ExpirationInDays: !Ref OutputRetentionDays
+          - Id: expire-job-metadata
+            Status: Enabled
+            Prefix: jobs/
+            ExpirationInDays: !Ref MetadataRetentionDays
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - {Key: project, Value: rvc-serverless}
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt DataBucket.Arn, !Sub "${DataBucket.Arn}/*"]
+            Condition:
+              Bool: {"aws:SecureTransport": "false"}
+
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"keep last 3 images","selection":{"tagStatus":"any",
+          "countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}
+      Tags:
+        - {Key: project, Value: rvc-serverless}
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/rvc-serverless/${AWS::StackName}/worker"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/rvc-serverless/${AWS::StackName}/api-access"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------- IAM (no root, no wildcards beyond batch:DescribeJobs which has no resource-level form) ----
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  JobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: "sts:AssumeRole"}
+      Policies:
+        - PolicyName: worker-data-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:GetObject"
+                Resource: [!Sub "${DataBucket.Arn}/inputs/*", !Sub "${DataBucket.Arn}/jobs/*"]
+              - Effect: Allow
+                Action: "s3:PutObject"
+                Resource: [!Sub "${DataBucket.Arn}/jobs/*", !Sub "${DataBucket.Arn}/outputs/*"]
+              - Effect: Allow
+                Action: "s3:DeleteObject"
+                Resource: !Sub "${DataBucket.Arn}/inputs/*"
+              - Effect: Allow
+                Action: "s3:ListBucket"
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringLike: {"s3:prefix": ["inputs/*", "jobs/*"]}
+              - !If
+                - HasHfToken
+                - Effect: Allow
+                  Action: "secretsmanager:GetSecretValue"
+                  Resource: !Ref HfTokenSecretArn
+                - !Ref AWS::NoValue
+
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: api-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject"]
+                Resource: [!Sub "${DataBucket.Arn}/jobs/*", !Sub "${DataBucket.Arn}/inputs/*"]
+              - Effect: Allow
+                Action: "s3:GetObject"
+                Resource: !Sub "${DataBucket.Arn}/outputs/*"
+              - Effect: Allow
+                Action: "s3:ListBucket"
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringLike: {"s3:prefix": ["jobs/*", "inputs/*"]}
+              - Effect: Allow
+                Action: "batch:SubmitJob"
+                Resource:
+                  - !Ref JobQueue
+                  - !Sub "arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${AWS::StackName}-worker"
+                  - !Sub "arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${AWS::StackName}-worker:*"
+              - Effect: Allow
+                Action: "batch:DescribeJobs"
+                Resource: "*"
+
+  # ---------- GPU compute: scale to zero, hard cap 4 vCPUs, On-Demand, no NAT ---------------
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: rvc worker - no inbound, HTTPS outbound only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS to ECR, S3, Secrets Manager, Hugging Face}
+
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: !Ref RootVolumeGiB, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1        # containers cannot reach the instance-profile credentials
+        UserData: !If
+          - EnableCache
+          - Fn::Base64: |
+              MIME-Version: 1.0
+              Content-Type: multipart/mixed; boundary="==RVCBOUNDARY=="
+
+              --==RVCBOUNDARY==
+              Content-Type: text/x-shellscript; charset="us-ascii"
+
+              #!/bin/bash
+              mkdir -p /var/cache/rvc-models
+              chown 10001:10001 /var/cache/rvc-models
+              chmod 0700 /var/cache/rvc-models
+              --==RVCBOUNDARY==--
+          - !Ref AWS::NoValue
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - {Key: project, Value: rvc-serverless}
+
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: EC2
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
+        MinvCpus: 0
+        DesiredvCpus: 0
+        MaxvCpus: !Ref MaxVCpus
+        InstanceTypes: [!Ref GpuInstanceType]
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds: [!Ref WorkerSecurityGroup]
+        InstanceRole: !GetAtt InstanceProfile.Arn
+        LaunchTemplate:
+          LaunchTemplateId: !Ref WorkerLaunchTemplate
+          Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+        Tags:
+          project: rvc-serverless
+
+  JobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub "${AWS::StackName}-queue"
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref ComputeEnvironment
+
+  JobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub "${AWS::StackName}-worker"
+      Type: container
+      PlatformCapabilities: [EC2]
+      RetryStrategy:
+        Attempts: 1                          # no automatic retries: a retry would re-bill GPU time
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
+      ContainerProperties:
+        Image: !Sub "${WorkerRepository.RepositoryUri}:${WorkerImageTag}"
+        JobRoleArn: !GetAtt JobRole.Arn
+        ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+        ResourceRequirements:
+          - {Type: VCPU, Value: "4"}
+          - {Type: MEMORY, Value: "14000"}
+          - {Type: GPU, Value: "1"}
+        ReadonlyRootFilesystem: false
+        Environment:
+          - {Name: BUCKET, Value: !Ref DataBucket}
+          - {Name: ALLOWED_HF_REPOS, Value: !Ref AllowedHfRepos}
+          - {Name: DEFAULT_HF_REPO, Value: !Ref DefaultHfRepo}
+          - {Name: REQUIRE_PINNED_REVISION, Value: !Ref RequirePinnedRevision}
+          - {Name: HF_TOKEN_SECRET_ARN, Value: !Ref HfTokenSecretArn}
+          - {Name: ALLOWED_INPUT_HOSTS, Value: !Ref AllowedInputHosts}
+          - {Name: MAX_INPUT_MB, Value: !Ref MaxInputMB}
+          - {Name: MAX_INPUT_SECONDS, Value: !Ref MaxInputSeconds}
+          - {Name: MAX_PTH_MB, Value: !Ref MaxPthMB}
+          - {Name: MAX_INDEX_MB, Value: !Ref MaxIndexMB}
+          - {Name: INFER_TIMEOUT_SECONDS, Value: "600"}
+          - {Name: DELETE_INPUT_AFTER_JOB, Value: "true"}
+          - Name: MODEL_CACHE_DIR
+            Value: !If [EnableCache, /cache, ""]
+          - {Name: MODEL_CACHE_MAX_MB, Value: "4096"}
+          - {Name: MODEL_CACHE_TTL_SECONDS, Value: "86400"}
+        Volumes: !If
+          - EnableCache
+          - [{Name: modelcache, Host: {SourcePath: /var/cache/rvc-models}}]
+          - !Ref AWS::NoValue
+        MountPoints: !If
+          - EnableCache
+          - [{ContainerPath: /cache, SourceVolume: modelcache, ReadOnly: false}]
+          - !Ref AWS::NoValue
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref WorkerLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: worker
+
+  # ---------- API ----------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+      Auth:
+        EnableIamAuthorizer: true
+        DefaultAuthorizer: AWS_IAM           # SigV4 only; there is no anonymous route
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ApiBurstLimit
+        ThrottlingRateLimit: !Ref ApiRateLimit
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","caller":"$context.identity.userArn","route":"$context.routeKey","status":"$context.status","latencyMs":"$context.responseLatency"}'
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: api.handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Ref DataBucket
+          JOB_QUEUE: !Ref JobQueue
+          JOB_DEFINITION: !Sub "${AWS::StackName}-worker"
+          ALLOWED_HF_REPOS: !Ref AllowedHfRepos
+          DEFAULT_HF_REPO: !Ref DefaultHfRepo
+          REQUIRE_PINNED_REVISION: !Ref RequirePinnedRevision
+          ALLOWED_INPUT_HOSTS: !Ref AllowedInputHosts
+          MAX_INPUT_MB: !Ref MaxInputMB
+      Events:
+        CreateJob:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /jobs, Method: POST}
+        StartJob:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/jobs/{jobId}/start", Method: POST}
+        GetJob:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/jobs/{jobId}", Method: GET}
+
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ApiFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------- optional cost alert (account-wide monthly cost; alerts only) --------------------
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudget
+    Properties:
+      Budget:
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  BucketName:
+    Value: !Ref DataBucket
+  WorkerRepositoryUri:
+    Value: !GetAtt WorkerRepository.RepositoryUri
+  JobQueueArn:
+    Value: !Ref JobQueue
